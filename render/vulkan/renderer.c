@@ -26,6 +26,8 @@
 #include "render/vulkan/shaders/texture.frag.h"
 #include "render/vulkan/shaders/quad.frag.h"
 #include "render/vulkan/shaders/output.frag.h"
+#include "render/vulkan/shaders/texture_round.frag.h"
+#include "render/vulkan/shaders/quad_round.frag.h"
 #include "types/wlr_buffer.h"
 #include "util/time.h"
 
@@ -1181,6 +1183,22 @@ static void vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	vkDestroyShaderModule(dev->dev, renderer->tex_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->quad_frag_module, NULL);
 	vkDestroyShaderModule(dev->dev, renderer->output_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->tex_round_frag_module, NULL);
+	vkDestroyShaderModule(dev->dev, renderer->quad_round_frag_module, NULL);
+
+	if (renderer->round_ds_layout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(dev->dev, renderer->round_ds_layout, NULL);
+	}
+	if (renderer->round_ds_pool != VK_NULL_HANDLE) {
+		vkDestroyDescriptorPool(dev->dev, renderer->round_ds_pool, NULL);
+	}
+	if (renderer->round_ubo != VK_NULL_HANDLE) {
+		if (renderer->round_ubo_map != NULL) {
+			vkUnmapMemory(dev->dev, renderer->round_ubo_mem);
+		}
+		vkDestroyBuffer(dev->dev, renderer->round_ubo, NULL);
+		vkFreeMemory(dev->dev, renderer->round_ubo_mem, NULL);
+	}
 
 	struct wlr_vk_pipeline_layout *pipeline_layout, *pipeline_layout_tmp;
 	wl_list_for_each_safe(pipeline_layout, pipeline_layout_tmp,
@@ -1495,9 +1513,10 @@ static const struct wlr_renderer_impl renderer_impl = {
 };
 
 // Initializes the VkDescriptorSetLayout and VkPipelineLayout needed
-// for the texture rendering pipeline using the given VkSampler.
+// for the texture rendering pipeline using the given VkSampler. A round
+// pipeline adds the shared rounded-params uniform layout as set 1.
 static bool init_tex_layouts(struct wlr_vk_renderer *renderer,
-		VkSampler tex_sampler, VkDescriptorSetLayout *out_ds_layout,
+		VkSampler tex_sampler, bool round, VkDescriptorSetLayout *out_ds_layout,
 		VkPipelineLayout *out_pipe_layout) {
 	VkResult res;
 	VkDevice dev = renderer->dev->dev;
@@ -1534,10 +1553,15 @@ static bool init_tex_layouts(struct wlr_vk_renderer *renderer,
 		},
 	};
 
+	VkDescriptorSetLayout set_layouts[] = {
+		*out_ds_layout,
+		round ? renderer->round_ds_layout : VK_NULL_HANDLE,
+	};
+
 	VkPipelineLayoutCreateInfo pl_info = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = out_ds_layout,
+		.setLayoutCount = round ? 2 : 1,
+		.pSetLayouts = set_layouts,
 		.pushConstantRangeCount = sizeof(pc_ranges) / sizeof(pc_ranges[0]),
 		.pPushConstantRanges = pc_ranges,
 	};
@@ -1657,7 +1681,7 @@ static bool pipeline_layout_key_equals(
 	assert(!a->ycbcr.format || vulkan_format_is_ycbcr(a->ycbcr.format));
 	assert(!b->ycbcr.format || vulkan_format_is_ycbcr(b->ycbcr.format));
 
-	if (a->filter_mode != b->filter_mode) {
+	if (a->filter_mode != b->filter_mode || a->round != b->round) {
 		return false;
 	}
 
@@ -1684,7 +1708,8 @@ static bool pipeline_key_equals(const struct wlr_vk_pipeline_key *a,
 		return false;
 	}
 
-	if (a->source == WLR_VK_SHADER_SOURCE_TEXTURE &&
+	if ((a->source == WLR_VK_SHADER_SOURCE_TEXTURE ||
+			a->source == WLR_VK_SHADER_SOURCE_TEXTURE_ROUND) &&
 			a->texture_transform != b->texture_transform) {
 		return false;
 	}
@@ -1756,11 +1781,28 @@ struct wlr_vk_pipeline *setup_get_or_create_pipeline(
 			.pName = "main",
 		};
 		break;
+	case WLR_VK_SHADER_SOURCE_SINGLE_COLOR_ROUND:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->quad_round_frag_module,
+			.pName = "main",
+		};
+		break;
 	case WLR_VK_SHADER_SOURCE_TEXTURE:
 		stages[1] = (VkPipelineShaderStageCreateInfo) {
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 			.module = renderer->tex_frag_module,
+			.pName = "main",
+			.pSpecializationInfo = &specialization,
+		};
+		break;
+	case WLR_VK_SHADER_SOURCE_TEXTURE_ROUND:
+		stages[1] = (VkPipelineShaderStageCreateInfo) {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			.module = renderer->tex_round_frag_module,
 			.pName = "main",
 			.pSpecializationInfo = &specialization,
 		};
@@ -2074,7 +2116,8 @@ struct wlr_vk_pipeline_layout *get_or_create_pipeline_layout(
 		return NULL;
 	}
 
-	if (!init_tex_layouts(renderer, pipeline_layout->sampler, &pipeline_layout->ds, &pipeline_layout->vk)) {
+	if (!init_tex_layouts(renderer, pipeline_layout->sampler, key->round,
+			&pipeline_layout->ds, &pipeline_layout->vk)) {
 		free(pipeline_layout);
 		return NULL;
 	}
@@ -2186,6 +2229,129 @@ static bool init_dummy_images(struct wlr_vk_renderer *renderer) {
 // Creates static render data, such as sampler, layouts and shader modules
 // for the given renderer.
 // Cleanup is done by destroying the renderer.
+/* The shared dynamic-UBO descriptor set round draws bind as set 1, and
+ * its backing ring: WLR_VK_ROUND_SLOTS slots of one wlr_vk_round_params,
+ * host-coherent and persistently mapped so draws can write a slot while
+ * recording and have the data land before the render pass submits. */
+static bool init_round_data(struct wlr_vk_renderer *renderer) {
+	VkResult res;
+	VkDevice dev = renderer->dev->dev;
+
+	VkPhysicalDeviceProperties phdev_props;
+	vkGetPhysicalDeviceProperties(renderer->dev->phdev, &phdev_props);
+	VkDeviceSize align = phdev_props.limits.minUniformBufferOffsetAlignment;
+	renderer->round_ubo_slot = (sizeof(struct wlr_vk_round_params) + align - 1)
+		/ align * align;
+
+	VkBufferCreateInfo buf_info = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = renderer->round_ubo_slot * WLR_VK_ROUND_SLOTS,
+		.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	res = vkCreateBuffer(dev, &buf_info, NULL, &renderer->round_ubo);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkCreateBuffer", res);
+		return false;
+	}
+
+	VkMemoryRequirements mem_reqs;
+	vkGetBufferMemoryRequirements(dev, renderer->round_ubo, &mem_reqs);
+
+	int mem_type_index = vulkan_find_mem_type(renderer->dev,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mem_reqs.memoryTypeBits);
+	if (mem_type_index < 0) {
+		wlr_log(WLR_ERROR, "Failed to find memory type");
+		return false;
+	}
+
+	VkMemoryAllocateInfo mem_info = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize = mem_reqs.size,
+		.memoryTypeIndex = (uint32_t)mem_type_index,
+	};
+	res = vkAllocateMemory(dev, &mem_info, NULL, &renderer->round_ubo_mem);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkAllocateMemory", res);
+		return false;
+	}
+	res = vkBindBufferMemory(dev, renderer->round_ubo, renderer->round_ubo_mem, 0);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkBindBufferMemory", res);
+		return false;
+	}
+	res = vkMapMemory(dev, renderer->round_ubo_mem, 0, VK_WHOLE_SIZE, 0,
+		&renderer->round_ubo_map);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkMapMemory", res);
+		return false;
+	}
+
+	VkDescriptorSetLayoutBinding ds_binding = {
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+	VkDescriptorSetLayoutCreateInfo ds_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &ds_binding,
+	};
+	res = vkCreateDescriptorSetLayout(dev, &ds_info, NULL,
+		&renderer->round_ds_layout);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkCreateDescriptorSetLayout", res);
+		return false;
+	}
+
+	VkDescriptorPoolSize pool_size = {
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.descriptorCount = 1,
+	};
+	VkDescriptorPoolCreateInfo pool_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.maxSets = 1,
+		.poolSizeCount = 1,
+		.pPoolSizes = &pool_size,
+	};
+	res = vkCreateDescriptorPool(dev, &pool_info, NULL, &renderer->round_ds_pool);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkCreateDescriptorPool", res);
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo ds_alloc = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = renderer->round_ds_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &renderer->round_ds_layout,
+	};
+	res = vkAllocateDescriptorSets(dev, &ds_alloc, &renderer->round_ds);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("vkAllocateDescriptorSets", res);
+		return false;
+	}
+
+	VkDescriptorBufferInfo ubo_info = {
+		.buffer = renderer->round_ubo,
+		.offset = 0,
+		.range = sizeof(struct wlr_vk_round_params),
+	};
+	VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = renderer->round_ds,
+		.dstBinding = 0,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.pBufferInfo = &ubo_info,
+	};
+	vkUpdateDescriptorSets(dev, 1, &write, 0, NULL);
+
+	return true;
+}
+
 static bool init_static_render_data(struct wlr_vk_renderer *renderer) {
 	VkResult res;
 	VkDevice dev = renderer->dev->dev;
@@ -2242,6 +2408,35 @@ static bool init_static_render_data(struct wlr_vk_renderer *renderer) {
 	if (res != VK_SUCCESS) {
 		wlr_vk_error("Failed to create blend->output fragment shader module", res);
 		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(texture_round_frag_data),
+		.pCode = texture_round_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->tex_round_frag_module);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("Failed to create tex round fragment shader module", res);
+		return false;
+	}
+
+	sinfo = (VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof(quad_round_frag_data),
+		.pCode = quad_round_frag_data,
+	};
+	res = vkCreateShaderModule(dev, &sinfo, NULL, &renderer->quad_round_frag_module);
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("Failed to create quad round fragment shader module", res);
+		return false;
+	}
+
+	if (!init_round_data(renderer)) {
+		// Rounded draws degrade to square corners rather than losing the
+		// renderer over a host-memory or descriptor failure
+		wlr_log(WLR_ERROR, "rounded corners unavailable on the vulkan renderer");
+		renderer->round_ubo_map = NULL;
 	}
 
 	return true;

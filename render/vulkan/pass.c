@@ -56,6 +56,49 @@ static void convert_pixman_box_to_vk_rect(const pixman_box32_t *box, VkRect2D *r
 	};
 }
 
+/* Write one draw's rounded-corner parameters into the next slot of the
+ * shared round_ubo ring and return its dynamic offset. False means the
+ * draw falls back to square corners: the shared buffer missing, or the
+ * ring exhausted for this pass. */
+static bool fill_round_params(struct wlr_vk_render_pass *pass,
+		const struct wlr_box *box, const float radii[static 4],
+		const struct wlr_box *cutout, const float cutout_radii[static 4],
+		const struct wlr_render_rounded_clip *clips, size_t clips_len,
+		uint32_t *dyn_offset) {
+	struct wlr_vk_renderer *renderer = pass->renderer;
+	if (renderer->round_ubo_map == NULL
+			|| pass->round_slots_used >= WLR_VK_ROUND_SLOTS) {
+		return false;
+	}
+
+	struct wlr_vk_round_params params = {
+		.origin = { box->x, box->y },
+		.size = { box->width, box->height },
+		.clip_count = (int32_t) clips_len,
+	};
+	memcpy(params.radii, radii, sizeof(params.radii));
+	for (size_t i = 0; i < clips_len; i++) {
+		params.clip_boxes[i][0] = clips[i].box.x - box->x;
+		params.clip_boxes[i][1] = clips[i].box.y - box->y;
+		params.clip_boxes[i][2] = clips[i].box.width;
+		params.clip_boxes[i][3] = clips[i].box.height;
+		memcpy(params.clip_radii[i], clips[i].radii, sizeof(params.clip_radii[i]));
+	}
+	if (cutout != NULL) {
+		params.cutout_box[0] = cutout->x - box->x;
+		params.cutout_box[1] = cutout->y - box->y;
+		params.cutout_box[2] = cutout->width;
+		params.cutout_box[3] = cutout->height;
+		memcpy(params.cutout_radii, cutout_radii, sizeof(params.cutout_radii));
+	}
+
+	uint32_t slot = pass->round_slots_used++;
+	memcpy((char *) renderer->round_ubo_map + slot * renderer->round_ubo_slot,
+		&params, sizeof(params));
+	*dyn_offset = slot * renderer->round_ubo_slot;
+	return true;
+}
+
 static float color_to_linear(float non_linear) {
 	return pow(non_linear, 2.2);
 }
@@ -721,7 +764,55 @@ static void render_pass_add_rect(struct wlr_render_pass *wlr_pass,
 	struct wlr_box box;
 	wlr_render_rect_options_get_box(options, pass->render_buffer->wlr_buffer, &box);
 
-	switch (options->blend_mode) {
+	uint32_t round_off = 0;
+	bool round = wlr_render_rect_options_is_rounded(options)
+		&& fill_round_params(pass, &box, options->corner_radii,
+			&options->cutout, options->cutout_radii,
+			options->clips, options->clips_len, &round_off);
+	// A cut corner or the cutout is transparent, so it always blends;
+	// the clear path cannot draw it. Slot or pipeline failure falls
+	// through to the plain path and the corners come out square.
+	if (round) {
+		float proj[9], matrix[9];
+		wlr_matrix_identity(proj);
+		wlr_matrix_project_box(matrix, &box, WL_OUTPUT_TRANSFORM_NORMAL, proj);
+		wlr_matrix_multiply(matrix, pass->projection, matrix);
+
+		struct wlr_vk_pipeline *pipe = setup_get_or_create_pipeline(
+			pass->render_setup,
+			&(struct wlr_vk_pipeline_key) {
+				.source = WLR_VK_SHADER_SOURCE_SINGLE_COLOR_ROUND,
+				.layout = { .round = true },
+				.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+			});
+		if (pipe == NULL) {
+			pass->failed = true;
+			pixman_region32_fini(&clip);
+			return;
+		}
+
+		struct wlr_vk_vert_pcr_data vert_pcr_data = {
+			.uv_off = { 0, 0 },
+			.uv_size = { 1, 1 },
+		};
+		encode_proj_matrix(matrix, vert_pcr_data.mat4);
+
+		bind_pipeline(pass, pipe->vk);
+		vkCmdPushConstants(cb, pipe->layout->vk,
+			VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);
+		vkCmdPushConstants(cb, pipe->layout->vk,
+			VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data), sizeof(float) * 4,
+			linear_color);
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			pipe->layout->vk, 1, 1, &pass->renderer->round_ds, 1, &round_off);
+
+		for (int i = 0; i < clip_rects_len; i++) {
+			VkRect2D rect;
+			convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
+			vkCmdSetScissor(cb, 0, 1, &rect);
+			vkCmdDraw(cb, 4, 1, 0, 0);
+		}
+	} else switch (options->blend_mode) {
 	case WLR_RENDER_BLEND_MODE_PREMULTIPLIED:;
 		float proj[9], matrix[9];
 		wlr_matrix_identity(proj);
@@ -811,6 +902,13 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	wlr_render_texture_options_get_dst_box(options, &dst_box);
 	float alpha = wlr_render_texture_options_get_alpha(options);
 
+	// A cut corner is transparent whatever the texture is, so it blends;
+	// slot failure falls back to square corners
+	uint32_t round_off = 0;
+	bool round = wlr_render_texture_options_is_rounded(options)
+		&& fill_round_params(pass, &dst_box, options->corner_radii, NULL,
+			NULL, options->clips, options->clips_len, &round_off);
+
 	float proj[9], matrix[9];
 	wlr_matrix_identity(proj);
 	wlr_matrix_project_box(matrix, &dst_box, options->transform, proj);
@@ -872,8 +970,10 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	struct wlr_vk_pipeline *pipe = setup_get_or_create_pipeline(
 		pass->render_setup,
 		&(struct wlr_vk_pipeline_key) {
-			.source = WLR_VK_SHADER_SOURCE_TEXTURE,
+			.source = round ? WLR_VK_SHADER_SOURCE_TEXTURE_ROUND
+				: WLR_VK_SHADER_SOURCE_TEXTURE,
 			.layout = {
+				.round = round,
 				.ycbcr = {
 					.format = is_ycbcr ? texture->format : NULL,
 					.encoding = color_encoding,
@@ -882,7 +982,8 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 				.filter_mode = options->filter_mode,
 			},
 			.texture_transform = tex_transform,
-			.blend_mode = !texture->has_alpha && alpha == 1.0 ?
+			.blend_mode = round ? WLR_RENDER_BLEND_MODE_PREMULTIPLIED :
+				!texture->has_alpha && alpha == 1.0 ?
 				WLR_RENDER_BLEND_MODE_NONE : options->blend_mode,
 		});
 	if (!pipe) {
@@ -921,8 +1022,14 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 
 	bind_pipeline(pass, pipe->vk);
 
-	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-		pipe->layout->vk, 0, 1, &view->ds, 0, NULL);
+	if (round) {
+		VkDescriptorSet sets[] = { view->ds, pass->renderer->round_ds };
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			pipe->layout->vk, 0, 2, sets, 1, &round_off);
+	} else {
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			pipe->layout->vk, 0, 1, &view->ds, 0, NULL);
+	}
 
 	vkCmdPushConstants(cb, pipe->layout->vk,
 		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);

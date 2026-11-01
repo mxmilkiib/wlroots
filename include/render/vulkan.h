@@ -129,6 +129,10 @@ bool vulkan_format_is_ycbcr(const struct wlr_vk_format *format);
 struct wlr_vk_pipeline_layout_key {
 	enum wlr_scale_filter_mode filter_mode;
 
+	// Round pipelines bind the shared wlr_vk_round_params dynamic uniform
+	// buffer as descriptor set 1
+	bool round;
+
 	// for YCbCr pipelines only
 	struct {
 		const struct wlr_vk_format *format;
@@ -166,6 +170,8 @@ enum wlr_vk_texture_transform {
 enum wlr_vk_shader_source {
 	WLR_VK_SHADER_SOURCE_TEXTURE,
 	WLR_VK_SHADER_SOURCE_SINGLE_COLOR,
+	WLR_VK_SHADER_SOURCE_TEXTURE_ROUND,
+	WLR_VK_SHADER_SOURCE_SINGLE_COLOR_ROUND,
 };
 
 // Constants used to pick the color transform for the blend-to-output
@@ -302,6 +308,19 @@ struct wlr_vk_renderer {
 	VkShaderModule tex_frag_module;
 	VkShaderModule quad_frag_module;
 	VkShaderModule output_module;
+	VkShaderModule tex_round_frag_module;
+	VkShaderModule quad_round_frag_module;
+
+	// Rounded corners: the shared dynamic-UBO descriptor all round draws
+	// bind as set 1, and its backing ring buffer, persistently mapped.
+	// round_ubo_map NULL means rounded draws degrade to square corners.
+	VkDescriptorSetLayout round_ds_layout;
+	VkDescriptorPool round_ds_pool;
+	VkDescriptorSet round_ds;
+	VkBuffer round_ubo;
+	VkDeviceMemory round_ubo_mem;
+	void *round_ubo_map;
+	VkDeviceSize round_ubo_slot;
 
 	struct wl_list pipeline_layouts; // struct wlr_vk_pipeline_layout.link
 
@@ -362,6 +381,23 @@ struct wlr_vk_vert_pcr_data {
 	float mat4[4][4];
 	float uv_off[2];
 	float uv_size[2];
+};
+
+/* Rounded corners: per-draw parameters written into a slot of
+ * wlr_vk_renderer.round_ubo and bound through the dynamic uniform
+ * descriptor; set 1 binding 0 of round pipelines. std140 twin of the
+ * RoundParams block in shaders/texture_round.frag and quad_round.frag. */
+#define WLR_VK_ROUND_SLOTS 512
+struct wlr_vk_round_params {
+	float origin[2]; /* destination box origin in buffer pixels */
+	float size[2];
+	float radii[4];
+	float cutout_box[4]; /* relative to origin; width 0 for none */
+	float cutout_radii[4];
+	float clip_boxes[WLR_RENDER_ROUNDED_CLIPS][4]; /* relative to origin */
+	float clip_radii[WLR_RENDER_ROUNDED_CLIPS][4];
+	int32_t clip_count;
+	int32_t _pad[3];
 };
 
 struct wlr_vk_frag_texture_pcr_data {
@@ -433,6 +469,8 @@ struct wlr_vk_render_pass {
 	uint64_t signal_point;
 
 	struct wl_array textures; // struct wlr_vk_render_pass_texture
+
+	uint32_t round_slots_used; // into renderer->round_ubo
 };
 
 struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *renderer,

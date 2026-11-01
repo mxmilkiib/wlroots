@@ -3,6 +3,8 @@ vulkan_shaders_src = [
 	'texture.frag',
 	'quad.frag',
 	'output.frag',
+	'texture_round.frag',
+	'quad_round.frag',
 ]
 
 vulkan_shaders = []

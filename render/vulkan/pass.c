@@ -62,7 +62,7 @@ static void convert_pixman_box_to_vk_rect(const pixman_box32_t *box, VkRect2D *r
  * ring exhausted for this pass. */
 static bool fill_round_params(struct wlr_vk_render_pass *pass,
 		const struct wlr_box *box, const float radii[static 4],
-		const struct wlr_box *cutout, const float cutout_radii[static 4],
+		const struct wlr_box *cutout, const float *cutout_radii,
 		const struct wlr_render_rounded_clip *clips, size_t clips_len,
 		uint32_t *dyn_offset) {
 	struct wlr_vk_renderer *renderer = pass->renderer;

@@ -516,6 +516,8 @@ bool output_cursor_refresh_color_transform(struct wlr_output_cursor *output_curs
 	// Source is sRGB, which has reference == max
 	struct wlr_color_luminances dst_lum;
 	wlr_color_transfer_function_get_default_luminance(img_desc->transfer_function, &dst_lum);
+	if (img_desc->sdr_white_luminance > 0)
+		dst_lum.reference = img_desc->sdr_white_luminance;
 	float luminance_multiplier = dst_lum.reference / dst_lum.max;
 	for (int i = 0; i < 9; ++i) {
 		matrix[i] *= luminance_multiplier;

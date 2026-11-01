@@ -95,6 +95,11 @@ enum wlr_output_state_mode_type {
  *
  * mastering_display_primaries, mastering_luminance, max_cll and max_fall are
  * optional. Luminances are given in cd/m².
+ *
+ * sdr_white_luminance is compositor-side only and is not signaled on the
+ * wire: when non-zero it replaces the transfer function's default
+ * reference luminance in the scene's output color transform, placing SDR
+ * white at the given level in cd/m².
  */
 struct wlr_output_image_description {
 	enum wlr_color_named_primaries primaries;
@@ -106,6 +111,8 @@ struct wlr_output_image_description {
 	} mastering_luminance;
 	double max_cll; // max content light level
 	double max_fall; // max frame-average light level
+
+	double sdr_white_luminance;
 };
 
 /**

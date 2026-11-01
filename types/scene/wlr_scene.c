@@ -2538,6 +2538,8 @@ static bool scene_output_combine_color_transforms(
 		wlr_color_transfer_function_get_default_luminance(
 			WLR_COLOR_TRANSFER_FUNCTION_SRGB, &srgb_lum);
 		wlr_color_transfer_function_get_default_luminance(img_desc->transfer_function, &dst_lum);
+		if (img_desc->sdr_white_luminance > 0)
+			dst_lum.reference = img_desc->sdr_white_luminance;
 		float luminance_multiplier = get_luminance_multiplier(&srgb_lum, &dst_lum);
 		for (int i = 0; i < 9; ++i) {
 			matrix[i] *= luminance_multiplier;

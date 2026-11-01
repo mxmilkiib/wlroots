@@ -14,11 +14,44 @@ struct wlr_pixman_pixel_format {
 
 struct wlr_pixman_buffer;
 
+// The A8 coverage tiles of one radius, one per corner (top-left, top-right,
+// bottom-right, bottom-left), made on first use
+struct wlr_pixman_corner_tiles {
+	int radius;
+	pixman_image_t *images[4];
+	struct wl_list link; // wlr_pixman_renderer.corner_tiles
+};
+
+// What a rounded mask was built from: the box size, its radii, the cutout
+// and the clips relative to the box, and the alpha. Compared bytewise, so it
+// is zeroed before it is filled.
+struct wlr_pixman_rounded_mask_key {
+	int width, height;
+	float radii[4];
+	struct wlr_box cutout;
+	float cutout_radii[4];
+	struct wlr_render_rounded_clip clips[WLR_RENDER_ROUNDED_CLIPS];
+	size_t clips_len;
+	float alpha;
+};
+
+// A cached rounded mask, newest first; the list holds one reference and
+// each use takes its own
+#define WLR_PIXMAN_ROUNDED_MASKS 64
+struct wlr_pixman_rounded_mask {
+	struct wlr_pixman_rounded_mask_key key;
+	pixman_image_t *image;
+	struct wl_list link; // wlr_pixman_renderer.rounded_masks
+};
+
 struct wlr_pixman_renderer {
 	struct wlr_renderer wlr_renderer;
 
 	struct wl_list buffers; // wlr_pixman_buffer.link
 	struct wl_list textures; // wlr_pixman_texture.link
+	struct wl_list corner_tiles; // wlr_pixman_corner_tiles.link
+	struct wl_list rounded_masks; // wlr_pixman_rounded_mask.link
+	size_t rounded_masks_len;
 
 	struct wlr_drm_format_set drm_formats;
 };

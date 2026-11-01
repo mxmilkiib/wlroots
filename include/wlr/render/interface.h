@@ -78,6 +78,14 @@ void wlr_render_texture_options_get_src_box(const struct wlr_render_texture_opti
 void wlr_render_texture_options_get_dst_box(const struct wlr_render_texture_options *options,
 	struct wlr_box *box);
 float wlr_render_texture_options_get_alpha(const struct wlr_render_texture_options *options);
+// Whether a corner radius or a rounded clip is set
+bool wlr_render_texture_options_is_rounded(const struct wlr_render_texture_options *options);
+// Whether a corner radius, the cutout or a rounded clip is set
+bool wlr_render_rect_options_is_rounded(const struct wlr_render_rect_options *options);
+// The radii a box of this size draws: by the edge rule of
+// struct wlr_render_rounded_clip
+void wlr_render_fit_corner_radii(float dst[static 4], const float radii[static 4],
+	double width, double height);
 void wlr_render_rect_options_get_box(const struct wlr_render_rect_options *options,
 	const struct wlr_buffer *buffer, struct wlr_box *box);
 

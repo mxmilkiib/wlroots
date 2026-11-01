@@ -61,6 +61,40 @@ float wlr_render_texture_options_get_alpha(const struct wlr_render_texture_optio
 	return *options->alpha;
 }
 
+static bool radii_set(const float radii[static 4]) {
+	return radii[0] > 0 || radii[1] > 0 || radii[2] > 0 || radii[3] > 0;
+}
+
+bool wlr_render_texture_options_is_rounded(const struct wlr_render_texture_options *options) {
+	return radii_set(options->corner_radii) || options->clips_len > 0;
+}
+
+bool wlr_render_rect_options_is_rounded(const struct wlr_render_rect_options *options) {
+	return radii_set(options->corner_radii) || options->cutout.width > 0 ||
+		options->clips_len > 0;
+}
+
+void wlr_render_fit_corner_radii(float dst[static 4], const float radii[static 4],
+		double width, double height) {
+	// Each edge with the two radii on it: top, right, bottom, left
+	double edges[4][3] = {
+		{ width, radii[0], radii[1] },
+		{ height, radii[1], radii[2] },
+		{ width, radii[3], radii[2] },
+		{ height, radii[0], radii[3] },
+	};
+	double f = 1.0;
+	for (int i = 0; i < 4; i++) {
+		double sum = edges[i][1] + edges[i][2];
+		if (sum > edges[i][0] && edges[i][0] / sum < f) {
+			f = edges[i][0] / sum;
+		}
+	}
+	for (int i = 0; i < 4; i++) {
+		dst[i] = radii[i] > 0 ? radii[i] * f : 0;
+	}
+}
+
 void wlr_render_rect_options_get_box(const struct wlr_render_rect_options *options,
 		const struct wlr_buffer *buffer, struct wlr_box *box) {
 	if (wlr_box_empty(&options->box)) {

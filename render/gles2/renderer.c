@@ -22,9 +22,13 @@
 
 #include "common_vert_src.h"
 #include "quad_frag_src.h"
+#include "quad_round_frag_src.h"
 #include "tex_rgba_frag_src.h"
 #include "tex_rgbx_frag_src.h"
 #include "tex_external_frag_src.h"
+#include "tex_rgba_round_frag_src.h"
+#include "tex_rgbx_round_frag_src.h"
+#include "tex_external_round_frag_src.h"
 
 static const struct wlr_renderer_impl renderer_impl;
 static const struct wlr_render_timer_impl render_timer_impl;
@@ -219,6 +223,10 @@ static void gles2_destroy(struct wlr_renderer *wlr_renderer) {
 	glDeleteProgram(renderer->shaders.tex_rgba.program);
 	glDeleteProgram(renderer->shaders.tex_rgbx.program);
 	glDeleteProgram(renderer->shaders.tex_ext.program);
+	glDeleteProgram(renderer->shaders.tex_rgba_round.program);
+	glDeleteProgram(renderer->shaders.tex_rgbx_round.program);
+	glDeleteProgram(renderer->shaders.tex_ext_round.program);
+	glDeleteProgram(renderer->shaders.quad_round.program);
 	pop_gles2_debug(renderer);
 
 	if (renderer->exts.KHR_debug) {
@@ -466,6 +474,33 @@ error:
 	return 0;
 }
 
+static void get_round_uniforms(GLuint prog, struct wlr_gles2_round_uniforms *round) {
+	round->size = glGetUniformLocation(prog, "size");
+	round->radii = glGetUniformLocation(prog, "radii");
+	round->clip_count = glGetUniformLocation(prog, "clip_count");
+	round->clip_boxes = glGetUniformLocation(prog, "clip_boxes");
+	round->clip_radii = glGetUniformLocation(prog, "clip_radii");
+}
+
+// A texture program with corner radii and rounded clips. The sampler is
+// looked up as "tex" like the plain programs, which the external shader
+// names texture0; the lookup then fails and the sampler keeps unit 0.
+static bool link_round_tex_program(struct wlr_gles2_renderer *renderer,
+		struct wlr_gles2_tex_shader *shader, const GLchar *frag_src) {
+	GLuint prog = link_program(renderer, common_vert_src, frag_src);
+	if (!prog) {
+		return false;
+	}
+	shader->program = prog;
+	shader->proj = glGetUniformLocation(prog, "proj");
+	shader->tex_proj = glGetUniformLocation(prog, "tex_proj");
+	shader->tex = glGetUniformLocation(prog, "tex");
+	shader->alpha = glGetUniformLocation(prog, "alpha");
+	shader->pos_attrib = glGetAttribLocation(prog, "pos");
+	get_round_uniforms(prog, &shader->round);
+	return true;
+}
+
 static bool check_gl_ext(const char *exts, const char *ext) {
 	size_t extlen = strlen(ext);
 	const char *end = exts + strlen(exts);
@@ -677,6 +712,28 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
 		renderer->shaders.tex_ext.pos_attrib = glGetAttribLocation(prog, "pos");
 	}
 
+	if (!link_round_tex_program(renderer, &renderer->shaders.tex_rgba_round,
+				tex_rgba_round_frag_src) ||
+			!link_round_tex_program(renderer, &renderer->shaders.tex_rgbx_round,
+				tex_rgbx_round_frag_src) ||
+			(renderer->exts.OES_egl_image_external &&
+			!link_round_tex_program(renderer, &renderer->shaders.tex_ext_round,
+				tex_external_round_frag_src))) {
+		goto error;
+	}
+
+	renderer->shaders.quad_round.program = prog =
+		link_program(renderer, common_vert_src, quad_round_frag_src);
+	if (!renderer->shaders.quad_round.program) {
+		goto error;
+	}
+	renderer->shaders.quad_round.proj = glGetUniformLocation(prog, "proj");
+	renderer->shaders.quad_round.color = glGetUniformLocation(prog, "color");
+	renderer->shaders.quad_round.pos_attrib = glGetAttribLocation(prog, "pos");
+	renderer->shaders.quad_round.cutout_box = glGetUniformLocation(prog, "cutout_box");
+	renderer->shaders.quad_round.cutout_radii = glGetUniformLocation(prog, "cutout_radii");
+	get_round_uniforms(prog, &renderer->shaders.quad_round.round);
+
 	pop_gles2_debug(renderer);
 
 	wlr_egl_unset_current(renderer->egl);
@@ -697,6 +754,10 @@ error:
 	glDeleteProgram(renderer->shaders.tex_rgba.program);
 	glDeleteProgram(renderer->shaders.tex_rgbx.program);
 	glDeleteProgram(renderer->shaders.tex_ext.program);
+	glDeleteProgram(renderer->shaders.tex_rgba_round.program);
+	glDeleteProgram(renderer->shaders.tex_rgbx_round.program);
+	glDeleteProgram(renderer->shaders.tex_ext_round.program);
+	glDeleteProgram(renderer->shaders.quad_round.program);
 
 	pop_gles2_debug(renderer);
 

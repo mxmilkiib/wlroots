@@ -75,6 +75,18 @@ enum wlr_render_blend_mode {
 };
 
 /**
+ * A box cut by four corner radii (top-left, top-right, bottom-right,
+ * bottom-left). Where the two radii on one edge add up to more than the edge,
+ * all four shrink by the smallest such ratio, as CSS border-radius does.
+ */
+struct wlr_render_rounded_clip {
+	struct wlr_box box;
+	float radii[4];
+};
+
+#define WLR_RENDER_ROUNDED_CLIPS 4
+
+/**
  * Filter modes.
  */
 enum wlr_scale_filter_mode {
@@ -95,6 +107,14 @@ struct wlr_render_texture_options {
 	const float *alpha;
 	/* Clip region, leave NULL to disable clipping */
 	const pixman_region32_t *clip;
+	/* Corner radii in destination pixels: top-left, top-right, bottom-right,
+	 * bottom-left. Pixels of dst_box outside an arc are not drawn. Leave all
+	 * zero to draw the whole box. */
+	float corner_radii[4];
+	/* Rounded clips in destination coordinates: only pixels inside every
+	 * clip are drawn. Leave clips_len 0 to disable them. */
+	struct wlr_render_rounded_clip clips[WLR_RENDER_ROUNDED_CLIPS];
+	size_t clips_len;
 	/* Transform applied to the source texture */
 	enum wl_output_transform transform;
 	/* Filtering */
@@ -147,6 +167,15 @@ struct wlr_render_rect_options {
 	struct wlr_render_color color;
 	/* Clip region, leave NULL to disable clipping */
 	const pixman_region32_t *clip;
+	/* Corner radii in destination pixels, as for a texture */
+	float corner_radii[4];
+	/* A rounded hole in destination coordinates: pixels inside it are not
+	 * drawn. Leave the width 0 for none. */
+	struct wlr_box cutout;
+	float cutout_radii[4];
+	/* Rounded clips, as for a texture */
+	struct wlr_render_rounded_clip clips[WLR_RENDER_ROUNDED_CLIPS];
+	size_t clips_len;
 	/* Blend mode */
 	enum wlr_render_blend_mode blend_mode;
 };

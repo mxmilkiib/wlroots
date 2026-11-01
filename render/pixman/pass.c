@@ -1,5 +1,7 @@
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
 #include "render/pixman.h"
 
 static const struct wlr_render_pass_impl render_pass_impl;
@@ -36,6 +38,220 @@ static pixman_op_t get_pixman_blending(enum wlr_render_blend_mode mode) {
 	abort();
 }
 
+// A corner's coverage tile: a radius by radius A8 square whose arc centre is
+// the square's inner corner, with the one pixel ramp of the GLES2
+// corner_alpha. Cached on the renderer per radius and corner.
+static pixman_image_t *corner_tile(struct wlr_pixman_renderer *renderer,
+		int radius, int corner) {
+	struct wlr_pixman_corner_tiles *tiles = NULL, *entry;
+	wl_list_for_each(entry, &renderer->corner_tiles, link) {
+		if (entry->radius == radius) {
+			tiles = entry;
+			break;
+		}
+	}
+	if (tiles == NULL) {
+		tiles = calloc(1, sizeof(*tiles));
+		if (tiles == NULL) {
+			return NULL;
+		}
+		tiles->radius = radius;
+		wl_list_insert(&renderer->corner_tiles, &tiles->link);
+	}
+	if (tiles->images[corner] != NULL) {
+		return tiles->images[corner];
+	}
+
+	pixman_image_t *image = pixman_image_create_bits(PIXMAN_a8, radius, radius, NULL, 0);
+	if (image == NULL) {
+		return NULL;
+	}
+	uint8_t *data = (uint8_t *)pixman_image_get_data(image);
+	int stride = pixman_image_get_stride(image);
+	double cx = corner == 0 || corner == 3 ? radius : 0;
+	double cy = corner == 0 || corner == 1 ? radius : 0;
+	for (int y = 0; y < radius; y++) {
+		for (int x = 0; x < radius; x++) {
+			double dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+			double dist = sqrt(dx * dx + dy * dy) - radius;
+			// 1 - smoothstep(-0.5, 0.5, dist)
+			double t = dist + 0.5;
+			t = t < 0 ? 0 : t > 1 ? 1 : t;
+			double coverage = 1.0 - t * t * (3.0 - 2.0 * t);
+			data[y * stride + x] = (uint8_t)(coverage * 255.0 + 0.5);
+		}
+	}
+	tiles->images[corner] = image;
+	return image;
+}
+
+// Multiply each nonzero corner's tile into the mask at the corners of the
+// box at (x, y) of the given size, the radii fitted to the box.
+static bool mask_cut_corners(struct wlr_pixman_renderer *renderer,
+		pixman_image_t *mask, int x, int y, int width, int height,
+		const float radii[static 4]) {
+	float fit[4];
+	wlr_render_fit_corner_radii(fit, radii, width, height);
+	for (int i = 0; i < 4; i++) {
+		int r = roundf(fit[i]);
+		if (r <= 0) {
+			continue;
+		}
+		pixman_image_t *tile = corner_tile(renderer, r, i);
+		if (tile == NULL) {
+			return false;
+		}
+		pixman_image_composite32(PIXMAN_OP_IN, tile, NULL, mask, 0, 0, 0, 0,
+			i == 0 || i == 3 ? x : x + width - r,
+			i == 0 || i == 1 ? y : y + height - r, r, r);
+	}
+	return true;
+}
+
+// An opaque A8 mask of the given size with its corners cut.
+static pixman_image_t *box_mask(struct wlr_pixman_renderer *renderer,
+		int width, int height, const float radii[static 4]) {
+	pixman_image_t *mask = pixman_image_create_bits(PIXMAN_a8, width, height, NULL, 0);
+	if (mask == NULL) {
+		return NULL;
+	}
+	pixman_image_fill_rectangles(PIXMAN_OP_SRC, mask,
+		&(pixman_color_t){ .alpha = 0xFFFF }, 1,
+		&(pixman_rectangle16_t){ 0, 0, width, height });
+	if (!mask_cut_corners(renderer, mask, 0, 0, width, height, radii)) {
+		pixman_image_unref(mask);
+		return NULL;
+	}
+	return mask;
+}
+
+// What a mask is built from, relative to the box, zeroed so it compares
+// bytewise
+static void rounded_mask_key(struct wlr_pixman_rounded_mask_key *key,
+		const struct wlr_box *box, const float radii[static 4],
+		const struct wlr_box *cutout, const float *cutout_radii,
+		const struct wlr_render_rounded_clip *clips, size_t clips_len, float alpha) {
+	memset(key, 0, sizeof(*key));
+	key->width = box->width;
+	key->height = box->height;
+	memcpy(key->radii, radii, sizeof(key->radii));
+	if (cutout != NULL && cutout->width > 0) {
+		key->cutout = (struct wlr_box){
+			.x = cutout->x - box->x,
+			.y = cutout->y - box->y,
+			.width = cutout->width,
+			.height = cutout->height,
+		};
+		memcpy(key->cutout_radii, cutout_radii, sizeof(key->cutout_radii));
+	}
+	for (size_t i = 0; i < clips_len; i++) {
+		key->clips[i].box = (struct wlr_box){
+			.x = clips[i].box.x - box->x,
+			.y = clips[i].box.y - box->y,
+			.width = clips[i].box.width,
+			.height = clips[i].box.height,
+		};
+		memcpy(key->clips[i].radii, clips[i].radii, sizeof(key->clips[i].radii));
+	}
+	key->clips_len = clips_len;
+	key->alpha = alpha;
+}
+
+// An A8 mask of the key's size: opaque, the corners cut, less the cutout
+// (width 0 for none), zero outside every rounded clip, times alpha when it is
+// not 1. The cutout is a rounded box mask taken out of it, so its corners are
+// exact wherever they overlap.
+static pixman_image_t *build_rounded_mask(struct wlr_pixman_renderer *renderer,
+		const struct wlr_pixman_rounded_mask_key *key) {
+	int width = key->width, height = key->height;
+	pixman_image_t *mask = box_mask(renderer, width, height, key->radii);
+	if (mask == NULL) {
+		return NULL;
+	}
+	bool ok = true;
+
+	const struct wlr_box *cutout = &key->cutout;
+	if (cutout->width > 0) {
+		pixman_image_t *hole = box_mask(renderer, cutout->width, cutout->height,
+			key->cutout_radii);
+		ok = hole != NULL;
+		if (ok) {
+			pixman_image_composite32(PIXMAN_OP_OUT_REVERSE, hole, NULL, mask,
+				0, 0, 0, 0, cutout->x, cutout->y, cutout->width, cutout->height);
+			pixman_image_unref(hole);
+		}
+	}
+
+	for (size_t i = 0; ok && i < key->clips_len; i++) {
+		struct wlr_box clip = key->clips[i].box;
+		pixman_region32_t outside;
+		pixman_region32_init_rect(&outside, 0, 0, width, height);
+		pixman_region32_t keep;
+		pixman_region32_init_rect(&keep, clip.x, clip.y, clip.width, clip.height);
+		pixman_region32_subtract(&outside, &outside, &keep);
+		int n;
+		const pixman_box32_t *boxes = pixman_region32_rectangles(&outside, &n);
+		pixman_image_fill_boxes(PIXMAN_OP_SRC, mask, &(pixman_color_t){0}, n, boxes);
+		pixman_region32_fini(&keep);
+		pixman_region32_fini(&outside);
+		ok = mask_cut_corners(renderer, mask, clip.x, clip.y, clip.width,
+			clip.height, key->clips[i].radii);
+	}
+
+	if (!ok) {
+		pixman_image_unref(mask);
+		return NULL;
+	}
+	if (key->alpha != 1) {
+		pixman_image_t *fill = pixman_image_create_solid_fill(&(struct pixman_color){
+			.alpha = 0xFFFF * key->alpha,
+		});
+		pixman_image_composite32(PIXMAN_OP_IN, fill, NULL, mask,
+			0, 0, 0, 0, 0, 0, width, height);
+		pixman_image_unref(fill);
+	}
+	return mask;
+}
+
+// The mask for a box with its radii, cutout, clips and alpha: a referenced
+// hit from the renderer's cache, or one built now and kept at its head, the
+// oldest dropped past WLR_PIXMAN_ROUNDED_MASKS. The caller unrefs its use.
+static pixman_image_t *rounded_mask(struct wlr_pixman_renderer *renderer,
+		const struct wlr_box *box, const float radii[static 4],
+		const struct wlr_box *cutout, const float *cutout_radii,
+		const struct wlr_render_rounded_clip *clips, size_t clips_len, float alpha) {
+	struct wlr_pixman_rounded_mask_key key;
+	rounded_mask_key(&key, box, radii, cutout, cutout_radii, clips, clips_len, alpha);
+
+	struct wlr_pixman_rounded_mask *entry;
+	wl_list_for_each(entry, &renderer->rounded_masks, link) {
+		if (memcmp(&entry->key, &key, sizeof(key)) == 0) {
+			return pixman_image_ref(entry->image);
+		}
+	}
+
+	pixman_image_t *mask = build_rounded_mask(renderer, &key);
+	if (mask == NULL) {
+		return NULL;
+	}
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL) {
+		return mask;
+	}
+	entry->key = key;
+	entry->image = mask;
+	wl_list_insert(&renderer->rounded_masks, &entry->link);
+	if (++renderer->rounded_masks_len > WLR_PIXMAN_ROUNDED_MASKS) {
+		struct wlr_pixman_rounded_mask *oldest =
+			wl_container_of(renderer->rounded_masks.prev, oldest, link);
+		pixman_image_unref(oldest->image);
+		wl_list_remove(&oldest->link);
+		free(oldest);
+		renderer->rounded_masks_len--;
+	}
+	return pixman_image_ref(mask);
+}
+
 static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 		const struct wlr_render_texture_options *options) {
 	struct wlr_pixman_render_pass *pass = get_render_pass(wlr_pass);
@@ -64,7 +280,13 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 
 	pixman_image_t *mask = NULL;
 	float alpha = wlr_render_texture_options_get_alpha(options);
-	if (alpha != 1) {
+	if (wlr_render_texture_options_is_rounded(options)) {
+		mask = rounded_mask(buffer->renderer, &dst_box, options->corner_radii,
+			NULL, NULL, options->clips, options->clips_len, alpha);
+		// A cut corner is transparent whatever the texture is, so it blends
+		op = PIXMAN_OP_OVER;
+	}
+	if (mask == NULL && alpha != 1) {
 		mask = pixman_image_create_solid_fill(&(struct pixman_color){
 			.alpha = 0xFFFF * alpha,
 		});
@@ -218,12 +440,24 @@ static void render_pass_add_rect(struct wlr_render_pass *wlr_pass,
 
 	pixman_image_t *fill = pixman_image_create_solid_fill(&color);
 
+	// A rounded rect is the fill through its coverage mask, so it blends
+	pixman_image_t *mask = NULL;
+	if (wlr_render_rect_options_is_rounded(options) && box.width > 0 && box.height > 0) {
+		mask = rounded_mask(buffer->renderer, &box, options->corner_radii,
+			&options->cutout, options->cutout_radii, options->clips,
+			options->clips_len, 1);
+		op = PIXMAN_OP_OVER;
+	}
+
 	pixman_image_set_clip_region32(buffer->image, options->clip);
-	pixman_image_composite32(op, fill, NULL, buffer->image,
+	pixman_image_composite32(op, fill, mask, buffer->image,
 		0, 0, 0, 0, box.x, box.y, box.width, box.height);
 	pixman_image_set_clip_region32(buffer->image, NULL);
 
 	pixman_image_unref(fill);
+	if (mask != NULL) {
+		pixman_image_unref(mask);
+	}
 }
 
 static const struct wlr_render_pass_impl render_pass_impl = {

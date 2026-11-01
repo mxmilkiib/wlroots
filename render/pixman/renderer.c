@@ -287,6 +287,24 @@ static void pixman_destroy(struct wlr_renderer *wlr_renderer) {
 		wlr_texture_destroy(&tex->wlr_texture);
 	}
 
+	struct wlr_pixman_corner_tiles *tiles, *tiles_tmp;
+	wl_list_for_each_safe(tiles, tiles_tmp, &renderer->corner_tiles, link) {
+		for (size_t i = 0; i < 4; i++) {
+			if (tiles->images[i] != NULL) {
+				pixman_image_unref(tiles->images[i]);
+			}
+		}
+		wl_list_remove(&tiles->link);
+		free(tiles);
+	}
+
+	struct wlr_pixman_rounded_mask *mask, *mask_tmp;
+	wl_list_for_each_safe(mask, mask_tmp, &renderer->rounded_masks, link) {
+		pixman_image_unref(mask->image);
+		wl_list_remove(&mask->link);
+		free(mask);
+	}
+
 	wlr_drm_format_set_finish(&renderer->drm_formats);
 
 	free(renderer);
@@ -330,6 +348,8 @@ struct wlr_renderer *wlr_pixman_renderer_create(void) {
 	renderer->wlr_renderer.features.output_color_transform = false;
 	wl_list_init(&renderer->buffers);
 	wl_list_init(&renderer->textures);
+	wl_list_init(&renderer->corner_tiles);
+	wl_list_init(&renderer->rounded_masks);
 
 	size_t len = 0;
 	const uint32_t *formats = get_pixman_drm_formats(&len);

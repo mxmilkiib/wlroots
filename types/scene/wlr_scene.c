@@ -4,6 +4,7 @@
 #include <wlr/backend.h>
 #include <wlr/render/swapchain.h>
 #include <wlr/render/drm_syncobj.h>
+#include <wlr/render/interface.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_compositor.h>
@@ -256,6 +257,77 @@ static bool scene_nodes_in_box(struct wlr_scene_node *node, struct wlr_box *box,
 	return _scene_nodes_in_box(node, box, iterator, user_data, x, y);
 }
 
+static bool radii_set(const float radii[static 4]) {
+	return radii[0] > 0 || radii[1] > 0 || radii[2] > 0 || radii[3] > 0;
+}
+
+static bool scene_buffer_has_corners(const struct wlr_scene_buffer *scene_buffer) {
+	return radii_set(scene_buffer->corner_radii) || scene_buffer->clips_len > 0;
+}
+
+static bool scene_rect_is_rounded(const struct wlr_scene_rect *scene_rect) {
+	return radii_set(scene_rect->corner_radii) || scene_rect->cutout_box.width > 0 ||
+		scene_rect->clips_len > 0;
+}
+
+// Store a clip list, zeroing the unused entries; whether it changed.
+static bool set_rounded_clips(struct wlr_render_rounded_clip dst[static WLR_SCENE_ROUNDED_CLIPS],
+		size_t *dst_len, const struct wlr_render_rounded_clip *clips, size_t len) {
+	assert(len <= WLR_SCENE_ROUNDED_CLIPS);
+	struct wlr_render_rounded_clip want[WLR_SCENE_ROUNDED_CLIPS] = {0};
+	if (len > 0) {
+		memcpy(want, clips, len * sizeof(*clips));
+	}
+	if (*dst_len == len && memcmp(dst, want, sizeof(want)) == 0) {
+		return false;
+	}
+	memcpy(dst, want, sizeof(want));
+	*dst_len = len;
+	return true;
+}
+
+// The box at (x, y) inset past its corner arcs: the largest plain rectangle
+// no arc reaches, one rect so it costs no allocation. An opaque region only
+// has to be inside the opaque pixels, so the thin bands beside the arcs are
+// given up rather than built. Corners are ordered top-left, top-right,
+// bottom-right, bottom-left.
+static struct wlr_box box_inside_corners(int x, int y, int width, int height,
+		const float radii[static 4]) {
+	int r[4];
+	for (int i = 0; i < 4; i++) {
+		r[i] = radii[i] > 0 ? (int)ceilf(radii[i]) : 0;
+	}
+	int left = r[0] > r[3] ? r[0] : r[3], right = r[1] > r[2] ? r[1] : r[2];
+	int top = r[0] > r[1] ? r[0] : r[1], bottom = r[2] > r[3] ? r[2] : r[3];
+	struct wlr_box box = {
+		.x = x + left,
+		.y = y + top,
+		.width = width - left - right,
+		.height = height - top - bottom,
+	};
+	if (box.width <= 0 || box.height <= 0) {
+		box = (struct wlr_box){0};
+	}
+	return box;
+}
+
+// A cut corner and everything outside a rounded clip may show what is below,
+// so neither is opaque: a buffer's region is kept inside its box less its
+// corners and inside each clip's box less the clip's, every one a single
+// rect. The buffer is at (x, y) with the given size.
+static void subtract_rounded(pixman_region32_t *opaque, int x, int y,
+		int width, int height, const float radii[static 4],
+		const struct wlr_render_rounded_clip *clips, size_t clips_len) {
+	struct wlr_box keep = box_inside_corners(x, y, width, height, radii);
+	pixman_region32_intersect_rect(opaque, opaque, keep.x, keep.y, keep.width, keep.height);
+	for (size_t i = 0; i < clips_len; i++) {
+		struct wlr_box clip = clips[i].box;
+		keep = box_inside_corners(x + clip.x, y + clip.y, clip.width, clip.height,
+			clips[i].radii);
+		pixman_region32_intersect_rect(opaque, opaque, keep.x, keep.y, keep.width, keep.height);
+	}
+}
+
 static void scene_node_opaque_region(struct wlr_scene_node *node, int x, int y,
 		pixman_region32_t *opaque) {
 	int width, height;
@@ -281,12 +353,27 @@ static void scene_node_opaque_region(struct wlr_scene_node *node, int x, int y,
 			pixman_region32_copy(opaque, &scene_buffer->opaque_region);
 			pixman_region32_intersect_rect(opaque, opaque, 0, 0, width, height);
 			pixman_region32_translate(opaque, x, y);
+			subtract_rounded(opaque, x, y, width, height, scene_buffer->corner_radii,
+				scene_buffer->clips, scene_buffer->clips_len);
 			return;
 		}
 	}
 
 	pixman_region32_fini(opaque);
 	pixman_region32_init_rect(opaque, x, y, width, height);
+	if (node->type == WLR_SCENE_NODE_BUFFER) {
+		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+		subtract_rounded(opaque, x, y, width, height, scene_buffer->corner_radii,
+			scene_buffer->clips, scene_buffer->clips_len);
+	} else if (node->type == WLR_SCENE_NODE_RECT) {
+		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
+		// A rounded rect counts nothing as opaque, as the raster it replaces
+		// did: any region it reported would split what is under it into
+		// strips on every commit, and a ring's hole shows what is below.
+		if (scene_rect_is_rounded(scene_rect)) {
+			pixman_region32_clear(opaque);
+		}
+	}
 }
 
 struct scene_update_data {
@@ -364,6 +451,54 @@ static void transform_output_box(struct wlr_box *box, const struct render_data *
 	enum wl_output_transform transform = wlr_output_transform_invert(data->transform);
 	scale_box(box, data->scale);
 	wlr_box_transform(box, box, transform, data->trans_width, data->trans_height);
+}
+
+// Corner radii in buffer pixels: scaled by the output scale and moved to the
+// corner the output transform moves them to, as transform_output_box moves a
+// box. Each corner is a unit square of a 2 by 2 box; where it lands names
+// its corner in buffer space.
+static void transform_corner_radii(float dst[static 4], const float src[static 4],
+		const struct render_data *data) {
+	enum wl_output_transform transform = wlr_output_transform_invert(data->transform);
+	for (int i = 0; i < 4; i++) {
+		struct wlr_box corner = {
+			.x = i == 0 || i == 3 ? 0 : 1,
+			.y = i == 0 || i == 1 ? 0 : 1,
+			.width = 1,
+			.height = 1,
+		};
+		wlr_box_transform(&corner, &corner, transform, 2, 2);
+		int j = corner.x == 0 ? (corner.y == 0 ? 0 : 3) : (corner.y == 0 ? 1 : 2);
+		dst[j] = src[i] * data->scale;
+	}
+}
+
+// A node-local rounded box at node position (x, y), moved into the
+// buffer-pixel space the render pass draws in.
+static void render_rounded_box(struct wlr_render_rounded_clip *dst,
+		const struct wlr_box *box, const float radii[static 4], int x, int y,
+		const struct render_data *data) {
+	dst->box = (struct wlr_box){
+		.x = x + box->x,
+		.y = y + box->y,
+		.width = box->width,
+		.height = box->height,
+	};
+	transform_output_box(&dst->box, data);
+	transform_corner_radii(dst->radii, radii, data);
+}
+
+// A node's corner radii and rounded clips in the buffer-pixel space of its
+// destination box, for the render pass.
+static void render_corners(float dst_radii[static 4],
+		struct wlr_render_rounded_clip *dst_clips, size_t *dst_len,
+		const float radii[static 4], const struct wlr_render_rounded_clip *clips,
+		size_t clips_len, int x, int y, const struct render_data *data) {
+	transform_corner_radii(dst_radii, radii, data);
+	for (size_t i = 0; i < clips_len; i++) {
+		render_rounded_box(&dst_clips[i], &clips[i].box, clips[i].radii, x, y, data);
+	}
+	*dst_len = clips_len;
 }
 
 static void scene_output_damage(struct wlr_scene_output *scene_output,
@@ -799,6 +934,41 @@ void wlr_scene_rect_set_color(struct wlr_scene_rect *rect, const float color[sta
 	scene_node_update(&rect->node, NULL);
 }
 
+void wlr_scene_rect_set_corner_radii(struct wlr_scene_rect *rect,
+		const float radii[static 4]) {
+	if (memcmp(rect->corner_radii, radii, sizeof(rect->corner_radii)) == 0) {
+		return;
+	}
+
+	memcpy(rect->corner_radii, radii, sizeof(rect->corner_radii));
+	scene_node_update(&rect->node, NULL);
+}
+
+void wlr_scene_rect_set_cutout(struct wlr_scene_rect *rect,
+		const struct wlr_box *box, const float radii[4]) {
+	struct wlr_box cutout_box = {0};
+	float cutout_radii[4] = {0};
+	if (box != NULL && box->width > 0 && box->height > 0) {
+		cutout_box = *box;
+		memcpy(cutout_radii, radii, sizeof(cutout_radii));
+	}
+	if (wlr_box_equal(&rect->cutout_box, &cutout_box) &&
+			memcmp(rect->cutout_radii, cutout_radii, sizeof(cutout_radii)) == 0) {
+		return;
+	}
+
+	rect->cutout_box = cutout_box;
+	memcpy(rect->cutout_radii, cutout_radii, sizeof(cutout_radii));
+	scene_node_update(&rect->node, NULL);
+}
+
+void wlr_scene_rect_set_rounded_clips(struct wlr_scene_rect *rect,
+		const struct wlr_render_rounded_clip *clips, size_t len) {
+	if (set_rounded_clips(rect->clips, &rect->clips_len, clips, len)) {
+		scene_node_update(&rect->node, NULL);
+	}
+}
+
 static void scene_buffer_handle_buffer_release(struct wl_listener *listener,
 		void *data) {
 	struct wlr_scene_buffer *scene_buffer =
@@ -1107,6 +1277,23 @@ void wlr_scene_buffer_set_dest_size(struct wlr_scene_buffer *scene_buffer,
 	scene_node_update(&scene_buffer->node, NULL);
 }
 
+void wlr_scene_buffer_set_corner_radii(struct wlr_scene_buffer *scene_buffer,
+		const float radii[static 4]) {
+	if (memcmp(scene_buffer->corner_radii, radii, sizeof(scene_buffer->corner_radii)) == 0) {
+		return;
+	}
+
+	memcpy(scene_buffer->corner_radii, radii, sizeof(scene_buffer->corner_radii));
+	scene_node_update(&scene_buffer->node, NULL);
+}
+
+void wlr_scene_buffer_set_rounded_clips(struct wlr_scene_buffer *scene_buffer,
+		const struct wlr_render_rounded_clip *clips, size_t len) {
+	if (set_rounded_clips(scene_buffer->clips, &scene_buffer->clips_len, clips, len)) {
+		scene_node_update(&scene_buffer->node, NULL);
+	}
+}
+
 void wlr_scene_buffer_set_transform(struct wlr_scene_buffer *scene_buffer,
 		enum wl_output_transform transform) {
 	if (scene_buffer->transform == transform) {
@@ -1388,6 +1575,41 @@ struct node_at_data {
 	struct wlr_scene_node *node;
 };
 
+// Whether (px, py) is inside the box with its corners cut by radii
+// (top-left, top-right, bottom-right, bottom-left), the shape the renderers
+// draw, radii fitted by the edge rule.
+static bool point_in_rounded_box(double px, double py, int x, int y,
+		int width, int height, const float radii[static 4]) {
+	if (px < x || py < y || px >= x + width || py >= y + height) {
+		return false;
+	}
+	float r[4];
+	wlr_render_fit_corner_radii(r, radii, width, height);
+	for (int i = 0; i < 4; i++) {
+		bool left = i == 0 || i == 3, top = i == 0 || i == 1;
+		double cx = left ? x + r[i] : x + width - r[i];
+		double cy = top ? y + r[i] : y + height - r[i];
+		double dx = left ? cx - px : px - cx, dy = top ? cy - py : py - cy;
+		if (r[i] > 0 && dx > 0 && dy > 0 && dx * dx + dy * dy > r[i] * r[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Whether (px, py) is inside every rounded clip.
+static bool point_in_rounded_clips(double px, double py,
+		const struct wlr_render_rounded_clip *clips, size_t clips_len) {
+	for (size_t i = 0; i < clips_len; i++) {
+		struct wlr_box clip = clips[i].box;
+		if (!point_in_rounded_box(px, py, clip.x, clip.y, clip.width, clip.height,
+				clips[i].radii)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool scene_node_at_iterator(struct wlr_scene_node *node,
 		int lx, int ly, void *data) {
 	struct node_at_data *at_data = data;
@@ -1398,9 +1620,39 @@ static bool scene_node_at_iterator(struct wlr_scene_node *node,
 	if (node->type == WLR_SCENE_NODE_BUFFER) {
 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
 
+		// A point in a cut corner or outside the rounded clip is not drawn,
+		// so it is not a hit; the surface's input region applies inside.
+		if (scene_buffer_has_corners(scene_buffer)) {
+			int width, height;
+			scene_node_get_size(node, &width, &height);
+			if (!point_in_rounded_box(rx, ry, 0, 0, width, height,
+					scene_buffer->corner_radii) ||
+					!point_in_rounded_clips(rx, ry, scene_buffer->clips,
+						scene_buffer->clips_len)) {
+				return false;
+			}
+		}
+
 		if (scene_buffer->point_accepts_input &&
 				!scene_buffer->point_accepts_input(scene_buffer, &rx, &ry)) {
 			return false;
+		}
+	} else if (node->type == WLR_SCENE_NODE_RECT) {
+		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
+
+		// A point in a cut corner, in the cutout or outside a rounded clip
+		// is not drawn, so it is not a hit.
+		if (scene_rect_is_rounded(scene_rect)) {
+			struct wlr_box cutout = scene_rect->cutout_box;
+			if (!point_in_rounded_box(rx, ry, 0, 0, scene_rect->width,
+					scene_rect->height, scene_rect->corner_radii) ||
+					(cutout.width > 0 && point_in_rounded_box(rx, ry, cutout.x,
+						cutout.y, cutout.width, cutout.height,
+						scene_rect->cutout_radii)) ||
+					!point_in_rounded_clips(rx, ry, scene_rect->clips,
+						scene_rect->clips_len)) {
+				return false;
+			}
 		}
 	}
 
@@ -1485,7 +1737,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 	case WLR_SCENE_NODE_RECT:;
 		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
 
-		wlr_render_pass_add_rect(data->render_pass, &(struct wlr_render_rect_options){
+		struct wlr_render_rect_options rect_options = {
 			.box = dst_box,
 			.color = {
 				.r = scene_rect->color[0],
@@ -1494,7 +1746,21 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 				.a = scene_rect->color[3],
 			},
 			.clip = &render_region,
-		});
+		};
+		if (scene_rect_is_rounded(scene_rect)) {
+			render_corners(rect_options.corner_radii, rect_options.clips,
+				&rect_options.clips_len, scene_rect->corner_radii,
+				scene_rect->clips, scene_rect->clips_len, x, y, data);
+			if (scene_rect->cutout_box.width > 0) {
+				struct wlr_render_rounded_clip cutout;
+				render_rounded_box(&cutout, &scene_rect->cutout_box,
+					scene_rect->cutout_radii, x, y, data);
+				rect_options.cutout = cutout.box;
+				memcpy(rect_options.cutout_radii, cutout.radii,
+					sizeof(rect_options.cutout_radii));
+			}
+		}
+		wlr_render_pass_add_rect(data->render_pass, &rect_options);
 		break;
 	case WLR_SCENE_NODE_BUFFER:;
 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
@@ -1538,7 +1804,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			WLR_COLOR_TRANSFER_FUNCTION_SRGB, &srgb_lum);
 		float luminance_multiplier = get_luminance_multiplier(&src_lum, &srgb_lum);
 
-		wlr_render_pass_add_texture(data->render_pass, &(struct wlr_render_texture_options) {
+		struct wlr_render_texture_options texture_options = {
 			.texture = texture,
 			.src_box = scene_buffer->src_box,
 			.dst_box = dst_box,
@@ -1556,7 +1822,13 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			.luminance_multiplier = &luminance_multiplier,
 			.wait_timeline = scene_buffer->wait_timeline,
 			.wait_point = scene_buffer->wait_point,
-		});
+		};
+		if (scene_buffer_has_corners(scene_buffer)) {
+			render_corners(texture_options.corner_radii, texture_options.clips,
+				&texture_options.clips_len, scene_buffer->corner_radii,
+				scene_buffer->clips, scene_buffer->clips_len, x, y, data);
+		}
+		wlr_render_pass_add_texture(data->render_pass, &texture_options);
 
 		struct wlr_scene_output_sample_event sample_event = {
 			.output = data->output,
@@ -1943,7 +2215,10 @@ static bool construct_render_list_iterator(struct wlr_scene_node *node,
 		struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
 		float *black = (float[4]){ 0.f, 0.f, 0.f, 1.f };
 
-		if (memcmp(rect->color, black, sizeof(float) * 4) == 0) {
+		// A rounded rect shows what is below its cut parts, which the
+		// background would cover
+		if (memcmp(rect->color, black, sizeof(float) * 4) == 0 &&
+				!scene_rect_is_rounded(rect)) {
 			return false;
 		}
 	}
@@ -2085,6 +2360,11 @@ static enum scene_direct_scanout_result scene_entry_try_direct_scanout(
 
 	struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
 	if (buffer->buffer == NULL) {
+		return SCANOUT_INELIGIBLE;
+	}
+
+	// A cut corner or a rounded clip is drawn by the renderer
+	if (scene_buffer_has_corners(buffer)) {
 		return SCANOUT_INELIGIBLE;
 	}
 

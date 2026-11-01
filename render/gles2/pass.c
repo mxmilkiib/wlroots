@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <pixman.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <wlr/render/drm_syncobj.h>
@@ -164,6 +165,27 @@ static void setup_blending(enum wlr_render_blend_mode mode) {
 	}
 }
 
+// The box size, its radii and its rounded clips, relative to the box origin
+static void set_round_uniforms(const struct wlr_gles2_round_uniforms *round,
+		const struct wlr_box *box, const float radii[static 4],
+		const struct wlr_render_rounded_clip *clips, size_t clips_len) {
+	GLfloat boxes[WLR_RENDER_ROUNDED_CLIPS][4], clip_radii[WLR_RENDER_ROUNDED_CLIPS][4];
+	for (size_t i = 0; i < clips_len; i++) {
+		boxes[i][0] = clips[i].box.x - box->x;
+		boxes[i][1] = clips[i].box.y - box->y;
+		boxes[i][2] = clips[i].box.width;
+		boxes[i][3] = clips[i].box.height;
+		memcpy(clip_radii[i], clips[i].radii, sizeof(clip_radii[i]));
+	}
+	glUniform2f(round->size, box->width, box->height);
+	glUniform4fv(round->radii, 1, radii);
+	glUniform1i(round->clip_count, clips_len);
+	if (clips_len > 0) {
+		glUniform4fv(round->clip_boxes, clips_len, &boxes[0][0]);
+		glUniform4fv(round->clip_radii, clips_len, &clip_radii[0][0]);
+	}
+}
+
 static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 		const struct wlr_render_texture_options *options) {
 	struct wlr_gles2_render_pass *pass = get_render_pass(wlr_pass);
@@ -171,20 +193,21 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	struct wlr_gles2_texture *texture = gles2_get_texture(options->texture);
 
 	struct wlr_gles2_tex_shader *shader = NULL;
+	bool round = wlr_render_texture_options_is_rounded(options);
 
 	switch (texture->target) {
 	case GL_TEXTURE_2D:
 		if (texture->has_alpha) {
-			shader = &renderer->shaders.tex_rgba;
+			shader = round ? &renderer->shaders.tex_rgba_round : &renderer->shaders.tex_rgba;
 		} else {
-			shader = &renderer->shaders.tex_rgbx;
+			shader = round ? &renderer->shaders.tex_rgbx_round : &renderer->shaders.tex_rgbx;
 		}
 		break;
 	case GL_TEXTURE_EXTERNAL_OES:
 		// EGL_EXT_image_dma_buf_import_modifiers requires
 		// GL_OES_EGL_image_external
 		assert(renderer->exts.OES_egl_image_external);
-		shader = &renderer->shaders.tex_ext;
+		shader = round ? &renderer->shaders.tex_ext_round : &renderer->shaders.tex_ext;
 		break;
 	default:
 		abort();
@@ -223,7 +246,9 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 		}
 	}
 
-	setup_blending(!texture->has_alpha && alpha == 1.0 ?
+	// A cut corner is transparent whatever the texture is, so it blends
+	setup_blending(round ? WLR_RENDER_BLEND_MODE_PREMULTIPLIED :
+		!texture->has_alpha && alpha == 1.0 ?
 		WLR_RENDER_BLEND_MODE_NONE : options->blend_mode);
 
 	glUseProgram(shader->program);
@@ -246,6 +271,10 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	glUniform1f(shader->alpha, alpha);
 	set_proj_matrix(shader->proj, pass->projection_matrix, &dst_box);
 	set_tex_matrix(shader->tex_proj, options->transform, &src_fbox);
+	if (round) {
+		set_round_uniforms(&shader->round, &dst_box, options->corner_radii,
+			options->clips, options->clips_len);
+	}
 
 	render(&dst_box, options->clip, shader->pos_attrib);
 
@@ -264,6 +293,21 @@ static void render_pass_add_rect(struct wlr_render_pass *wlr_pass,
 	wlr_render_rect_options_get_box(options, wlr_buffer, &box);
 
 	push_gles2_debug(renderer);
+	if (wlr_render_rect_options_is_rounded(options)) {
+		// A cut corner or the cutout is transparent, so it blends
+		setup_blending(WLR_RENDER_BLEND_MODE_PREMULTIPLIED);
+		glUseProgram(renderer->shaders.quad_round.program);
+		set_proj_matrix(renderer->shaders.quad_round.proj, pass->projection_matrix, &box);
+		glUniform4f(renderer->shaders.quad_round.color, color->r, color->g, color->b, color->a);
+		set_round_uniforms(&renderer->shaders.quad_round.round, &box,
+			options->corner_radii, options->clips, options->clips_len);
+		glUniform4f(renderer->shaders.quad_round.cutout_box, options->cutout.x - box.x,
+			options->cutout.y - box.y, options->cutout.width, options->cutout.height);
+		glUniform4fv(renderer->shaders.quad_round.cutout_radii, 1, options->cutout_radii);
+		render(&box, options->clip, renderer->shaders.quad_round.pos_attrib);
+		pop_gles2_debug(renderer);
+		return;
+	}
 	enum wlr_render_blend_mode blend_mode =
 		color->a == 1.0 ? WLR_RENDER_BLEND_MODE_NONE : options->blend_mode;
 	if (blend_mode == WLR_RENDER_BLEND_MODE_NONE &&

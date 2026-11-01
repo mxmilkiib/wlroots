@@ -28,6 +28,15 @@ struct wlr_gles2_pixel_format {
 	GLint gl_format, gl_type;
 };
 
+// The uniforms every round program reads, beside its own
+struct wlr_gles2_round_uniforms {
+	GLint size;
+	GLint radii;
+	GLint clip_count;
+	GLint clip_boxes;
+	GLint clip_radii;
+};
+
 struct wlr_gles2_tex_shader {
 	GLuint program;
 	GLint proj;
@@ -35,6 +44,9 @@ struct wlr_gles2_tex_shader {
 	GLint tex;
 	GLint alpha;
 	GLint pos_attrib;
+	// Set on the round programs only: the destination box size in pixels,
+	// its corner radii, and the rounded clips relative to it
+	struct wlr_gles2_round_uniforms round;
 };
 
 struct wlr_gles2_renderer {
@@ -80,9 +92,25 @@ struct wlr_gles2_renderer {
 			GLint color;
 			GLint pos_attrib;
 		} quad;
+		// A rect with corner radii, a cutout or rounded clips, chosen only
+		// when it has one of them
+		struct {
+			GLuint program;
+			GLint proj;
+			GLint color;
+			GLint pos_attrib;
+			GLint cutout_box;
+			GLint cutout_radii;
+			struct wlr_gles2_round_uniforms round;
+		} quad_round;
 		struct wlr_gles2_tex_shader tex_rgba;
 		struct wlr_gles2_tex_shader tex_rgbx;
 		struct wlr_gles2_tex_shader tex_ext;
+		// The same three with corner radii and a rounded clip, chosen only
+		// when a texture is drawn with either
+		struct wlr_gles2_tex_shader tex_rgba_round;
+		struct wlr_gles2_tex_shader tex_rgbx_round;
+		struct wlr_gles2_tex_shader tex_ext_round;
 	} shaders;
 
 	struct wl_list buffers; // wlr_gles2_buffer.link

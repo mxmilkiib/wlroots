@@ -22,6 +22,7 @@
 #include <pixman.h>
 #include <time.h>
 #include <wayland-server-core.h>
+#include <wlr/render/pass.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_damage_ring.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
@@ -138,11 +139,26 @@ struct wlr_scene_surface {
 	} WLR_PRIVATE;
 };
 
+/** The most rounded clips a rect or buffer node carries */
+#define WLR_SCENE_ROUNDED_CLIPS WLR_RENDER_ROUNDED_CLIPS
+
 /** A scene-graph node displaying a solid-colored rectangle */
 struct wlr_scene_rect {
 	struct wlr_scene_node node;
 	int width, height;
 	float color[4];
+
+	// Corner radii in logical pixels: top-left, top-right, bottom-right,
+	// bottom-left. Pixels outside an arc are not drawn and are not opaque.
+	float corner_radii[4];
+	// A rounded hole in node-local logical pixels, the inside of a border
+	// ring; width 0 for none.
+	struct wlr_box cutout_box;
+	float cutout_radii[4];
+	// Rounded clips in node-local logical pixels: only pixels inside every
+	// clip are drawn.
+	struct wlr_render_rounded_clip clips[WLR_SCENE_ROUNDED_CLIPS];
+	size_t clips_len;
 };
 
 struct wlr_scene_outputs_update_event {
@@ -197,6 +213,15 @@ struct wlr_scene_buffer {
 	enum wlr_color_named_primaries primaries;
 	enum wlr_color_encoding color_encoding;
 	enum wlr_color_range color_range;
+
+	// Corner radii in logical pixels: top-left, top-right, bottom-right,
+	// bottom-left. Pixels outside an arc are not drawn and are not opaque.
+	// All zero draws the whole buffer.
+	float corner_radii[4];
+	// Rounded clips in node-local logical pixels: only pixels inside every
+	// clip are drawn.
+	struct wlr_render_rounded_clip clips[WLR_SCENE_ROUNDED_CLIPS];
+	size_t clips_len;
 
 	struct {
 		uint64_t active_outputs;
@@ -470,6 +495,27 @@ void wlr_scene_rect_set_size(struct wlr_scene_rect *rect, int width, int height)
 void wlr_scene_rect_set_color(struct wlr_scene_rect *rect, const float color[static 4]);
 
 /**
+ * Set the corner radii of a rectangle node, in logical pixels, as for a
+ * buffer. All zero (the default) draws the whole rectangle.
+ */
+void wlr_scene_rect_set_corner_radii(struct wlr_scene_rect *rect,
+	const float radii[static 4]);
+
+/**
+ * Set a rounded hole in node-local logical pixels: pixels inside the box,
+ * cut by its radii, are not drawn. NULL (the default) removes it; radii is
+ * read only with a box.
+ */
+void wlr_scene_rect_set_cutout(struct wlr_scene_rect *rect,
+	const struct wlr_box *box, const float radii[4]);
+
+/**
+ * Set the rounded clips of a rectangle node, as for a buffer.
+ */
+void wlr_scene_rect_set_rounded_clips(struct wlr_scene_rect *rect,
+	const struct wlr_render_rounded_clip *clips, size_t len);
+
+/**
  * Add a node displaying a buffer to the scene-graph.
  *
  * If the buffer is NULL, this node will not be displayed.
@@ -547,6 +593,23 @@ void wlr_scene_buffer_set_dest_size(struct wlr_scene_buffer *scene_buffer,
  */
 void wlr_scene_buffer_set_transform(struct wlr_scene_buffer *scene_buffer,
 	enum wl_output_transform transform);
+
+/**
+ * Set the corner radii cutting the buffer, in logical pixels: top-left,
+ * top-right, bottom-right, bottom-left. All zero (the default) draws the
+ * whole buffer. Radii that do not fit an edge shrink by the edge rule of
+ * struct wlr_render_rounded_clip.
+ */
+void wlr_scene_buffer_set_corner_radii(struct wlr_scene_buffer *scene_buffer,
+	const float radii[static 4]);
+
+/**
+ * Set the rounded clips in node-local logical pixels: only pixels inside
+ * every clip are drawn. len 0 (the default) removes them; len is at most
+ * WLR_SCENE_ROUNDED_CLIPS.
+ */
+void wlr_scene_buffer_set_rounded_clips(struct wlr_scene_buffer *scene_buffer,
+	const struct wlr_render_rounded_clip *clips, size_t len);
 
 /**
 * Sets the opacity of this buffer
